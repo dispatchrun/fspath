@@ -2,20 +2,12 @@ package fspath
 
 import (
 	"errors"
-	"fmt"
 	"io/fs"
 	"path"
 	"strings"
-)
 
-// ReadLinkFS is an extension of the fs.FS interface implemented by file systems
-// which support symbolic links.
-//
-// TODO: replace with fs.ReadLinkFS (https://github.com/golang/go/issues/49580)
-type ReadLinkFS interface {
-	fs.FS
-	ReadLink(string) (string, error)
-}
+	"github.com/stealthrocket/fslink"
+)
 
 var (
 	// ErrLoop is returned when attempting to resolve paths that have followed
@@ -32,7 +24,7 @@ func Stat(fsys fs.FS, name string) (fs.FileInfo, error) {
 }
 
 func Sub(fsys fs.FS, name string) (fs.FS, error) {
-	return lookup(fsys, name, sub)
+	return lookup(fsys, name, fslink.Sub)
 }
 
 func ReadDir(fsys fs.FS, name string) ([]fs.DirEntry, error) {
@@ -44,13 +36,7 @@ func ReadFile(fsys fs.FS, name string) ([]byte, error) {
 }
 
 func ReadLink(fsys fs.FS, name string) (string, error) {
-	return lookup(fsys, name, func(fsys fs.FS, name string) (string, error) {
-		if f, ok := fsys.(ReadLinkFS); ok {
-			return f.ReadLink(name)
-		}
-		err := fmt.Errorf("symlink found in file system which does not implement fs.ReadLinkFS: %t", fsys)
-		return "", &fs.PathError{"readlink", name, err}
-	})
+	return lookup(fsys, name, fslink.ReadLink)
 }
 
 func lookup[F func(fs.FS, string) (R, error), R any](fsys fs.FS, name string, fn F) (ret R, err error) {
@@ -72,7 +58,7 @@ var symlink = errors.New("symlink")
 // base name of the file to look for in this directory. The name is guaranteed
 // not to refer to a symbolic link.
 //
-// The functional guarantees that links never escape the file system root.
+// The function guarantees that links never escape the file system root.
 // If a link pointing above the root is encountered, it is rebased off of the
 // root similarly to how "/.." resolves to "/" on posix systems. Lookup can
 // therefore be used as a sandboxing mechanism to prevent escaping the bounds
@@ -104,7 +90,7 @@ func Lookup(fsys fs.FS, name string) (fs.FS, string, error) {
 			// both Open and Stat will follow links, so we opportunistically try
 			// to read the path as a link and assume that if it fails we are not
 			// in the presence of a symbolic link.
-			if f, ok := fsys.(ReadLinkFS); ok {
+			if f, ok := fsys.(fslink.ReadLinkFS); ok {
 				link, err := f.ReadLink(base)
 				switch {
 				case err == nil:
@@ -150,7 +136,7 @@ func Lookup(fsys fs.FS, name string) (fs.FS, string, error) {
 			}
 
 			if len(prefix) < len(name) {
-				sub, err := sub(fsys, base)
+				sub, err := fslink.Sub(fsys, base)
 				if err != nil {
 					return err
 				}
@@ -202,7 +188,7 @@ func (fsys rootFS) Stat(name string) (fs.FileInfo, error) {
 }
 
 func (fsys rootFS) Sub(name string) (fs.FS, error) {
-	return sub(noSubRootFS{fsys}, name)
+	return fslink.Sub(noSubRootFS{fsys}, name)
 }
 
 func (fsys rootFS) ReadDir(name string) ([]fs.DirEntry, error) {
@@ -222,117 +208,8 @@ type noSubRootFS struct{ rootFS }
 func (noSubRootFS) Sub() {} // wrong signature, does not match fs.SubFS
 
 var (
-	_ fs.StatFS     = rootFS{}
-	_ fs.ReadDirFS  = rootFS{}
-	_ fs.ReadFileFS = rootFS{}
-	_ ReadLinkFS    = rootFS{}
+	_ fs.StatFS         = rootFS{}
+	_ fs.ReadDirFS      = rootFS{}
+	_ fs.ReadFileFS     = rootFS{}
+	_ fslink.ReadLinkFS = rootFS{}
 )
-
-// TODO: the code below is copied from the Go standard library to add the
-// ReadLink method to subFS. We should remove it when ReadLinkFS has been added.
-
-func (f *subFS) ReadLink(name string) (string, error) {
-	full, err := f.fullName("readlink", name)
-	if err != nil {
-		return "", err
-	}
-	if r, ok := f.fsys.(ReadLinkFS); ok {
-		return r.ReadLink(full)
-	}
-	return "", &fs.PathError{"readlink", name, fmt.Errorf("ReadLink called on file system which does not implement fs.ReadLinkFS: %T", f.fsys)}
-}
-
-var (
-	_ ReadLinkFS = (*subFS)(nil)
-)
-
-// =============================================================================
-// Copyright 2020 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-// =============================================================================
-
-func sub(fsys fs.FS, dir string) (fs.FS, error) {
-	if !fs.ValidPath(dir) {
-		return nil, &fs.PathError{Op: "sub", Path: dir, Err: errors.New("invalid name")}
-	}
-	if dir == "." {
-		return fsys, nil
-	}
-	if fsys, ok := fsys.(fs.SubFS); ok {
-		return fsys.Sub(dir)
-	}
-	return &subFS{fsys, dir}, nil
-}
-
-type subFS struct {
-	fsys fs.FS
-	dir  string
-}
-
-// fullName maps name to the fully-qualified name dir/name.
-func (f *subFS) fullName(op string, name string) (string, error) {
-	if !fs.ValidPath(name) {
-		return "", &fs.PathError{Op: op, Path: name, Err: errors.New("invalid name")}
-	}
-	return path.Join(f.dir, name), nil
-}
-
-// shorten maps name, which should start with f.dir, back to the suffix after f.dir.
-func (f *subFS) shorten(name string) (rel string, ok bool) {
-	if name == f.dir {
-		return ".", true
-	}
-	if len(name) >= len(f.dir)+2 && name[len(f.dir)] == '/' && name[:len(f.dir)] == f.dir {
-		return name[len(f.dir)+1:], true
-	}
-	return "", false
-}
-
-// fixErr shortens any reported names in PathErrors by stripping f.dir.
-func (f *subFS) fixErr(err error) error {
-	if e, ok := err.(*fs.PathError); ok {
-		if short, ok := f.shorten(e.Path); ok {
-			e.Path = short
-		}
-	}
-	return err
-}
-
-func (f *subFS) Open(name string) (fs.File, error) {
-	full, err := f.fullName("open", name)
-	if err != nil {
-		return nil, err
-	}
-	file, err := f.fsys.Open(full)
-	return file, f.fixErr(err)
-}
-
-func (f *subFS) ReadDir(name string) ([]fs.DirEntry, error) {
-	full, err := f.fullName("read", name)
-	if err != nil {
-		return nil, err
-	}
-	dir, err := fs.ReadDir(f.fsys, full)
-	return dir, f.fixErr(err)
-}
-
-func (f *subFS) ReadFile(name string) ([]byte, error) {
-	full, err := f.fullName("read", name)
-	if err != nil {
-		return nil, err
-	}
-	data, err := fs.ReadFile(f.fsys, full)
-	return data, f.fixErr(err)
-}
-
-func (f *subFS) Sub(dir string) (fs.FS, error) {
-	if dir == "." {
-		return f, nil
-	}
-	full, err := f.fullName("sub", dir)
-	if err != nil {
-		return nil, err
-	}
-	return &subFS{f.fsys, full}, nil
-}
